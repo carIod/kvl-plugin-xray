@@ -1,0 +1,11 @@
+Package: kvl-plugin-xray
+Version: 1.0.0
+Depends: xray-core
+Source: /opt/home/carIod/kvl-plugin-xray
+SourceName: kvl-plugin-xray
+Section: utils
+SourceDateEpoch: 1757228439
+URL: no
+Architecture: all
+Installed-Size: 41543
+Description:  Плагин поддержки клиента Xray для пакета КВАС ЛАЙТ
