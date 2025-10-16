@@ -1,9 +1,9 @@
 #!/bin/sh
 
-VERSION=1.0.0
+VERSION=1.0.1
 PR_NAME="Xray-core"
 PR_TYPE="Прозрачный прокси"
-DESCRIPTION="Xray (vless/ss)"
+#DESCRIPTION="Xray (vless/ss)"
 TEMPLATES="/opt/apps/kvl/bin/plugins/templates"
 PROC=xray
 CONF="/opt/etc/kvl/xray-conf.json"
@@ -193,6 +193,15 @@ read_fake_host() {
             special=""
             ;;
     esac
+}
+
+read_allowInsecure() {
+  read_value "${ansi_yellow}🕵️ Игнорировать сертификат сервера?, но есть риски MITM (y/n)" disguise || disguise="n"
+  case "$disguise" in
+    [Yy]*) allowInsecure="true" ;;
+    [Qq]*) exit 1 ;;   
+    *) allowInsecure="false" ;;
+  esac
 }
 
 parse_vless(){
@@ -389,6 +398,140 @@ parse_shadowsocks(){
 
 }
 
+parse_trojan() {
+  # Удаляем префикс trojan://
+  local core="${1#trojan://}"
+  local local_port="$2"
+  local cfg_file="$3"
+
+  # Проверяем наличие # в строке
+  if [[ "$core" == *"#"* ]]; then
+    desc="${core#*#}"
+    core="${core%%#*}"
+  else
+    desc=""
+  fi
+  # Проверяем, что строка содержит @
+  if [[ "$core" != *"@"* ]]; then
+    echo -e "${ansi_red}Ошибка: некорректный формат строки (отсутствует @)${ansi_std}" >&2
+    return 1
+  fi
+  # Извлекаем password, host и port
+  password="${core%%@*}"
+  # Проверяем password
+  if [ -z "$password" ]; then
+    echo -e "${ansi_red}Ошибка: password пустой${ansi_std}" >&2
+    return 1
+  fi
+  # Извлекаем подстроку host:port
+  hostport="${core#*@}"
+  hostport="${hostport%%\?*}"
+  if [[ ! "$hostport" =~ ^[^:]+:[0-9]+$ ]]; then
+    echo -e "${ansi_red}Ошибка: некорректный формат host:port${ansi_std}" >&2
+    return 1
+  fi  
+  if [[ "$hostport" != *:* || "$hostport" == *:*:* ]]; then
+    echo -e "${ansi_red}Ошибка: некорректный формат host:port${ansi_std}" >&2
+    return 1
+  fi
+  address="${hostport%:*}"
+  port="${hostport#*:}"
+  if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+    echo -e "${ansi_red}❌ Ошибка: неверный порт (должен быть 1-65535)${ansi_std}" >&2
+    return 1
+  fi
+  # Извлекаем query (всё после ?)
+  query="${core#*\?}"
+  # Парсим основные параметры
+  # Базовая безопасность передачи данных tls, xtls, не может быть пустой строкой.
+  security=$(get_param "$query" security)
+  if [ -z "$security" ]; then
+    security=tls
+    echo -e "${ansi_yellow}Предупреждение: security не указан будет использоваться 'tls'${ansi_std}" >&2
+  fi
+  # Способ передачи tcp, ws, grpc, httpupgrade, h2
+  network=$(get_param "$query" type)
+  if [ -z "$network" ]; then
+    network=tcp
+    echo -e "${ansi_yellow}Предупреждение: network не указан будет использоваться 'tcp'${ansi_std}" >&2
+  fi  
+  # Проверяем обязательные параметры
+  if [ -z "$password" ] || [ -z "$address" ] || [ -z "$port" ] || [ -z "$security" ] || [ -z "$network" ]; then
+    echo -e "${ansi_red}❌ Ошибка: обязательные поля отсутствуют в ссылке${ansi_std}"
+    return 1
+  fi
+  # Имя сервиса для gRPC
+  serviceName=$(get_param "$query" serviceName)
+  if [ "$network" = "grpc" ] && [ -z "$serviceName" ]; then
+    echo -e "${ansi_red}Ошибка: Используется тип транспорта grpc, но serviceName не указан${ansi_std}" >&2
+    return 1
+  fi
+
+  # Содержимое заголовка запроса WebSocket Host
+  header_host=$(get_param "$query" host)
+
+  # TLS SNI, соответствующий элементу в файле конфигурации serverName При пропуске используется повторно remote-host.
+  sni=$(get_param "$query" sni)
+ # Путь к WebSocket Если не указан, по умолчанию используется значение /, но не может быть пустой строкой.
+  path=$(get_param "$query" path "/")
+
+  alpn=$(get_param "$query" alpn)
+
+  if [ -n "$alpn" ]; then
+    alpn="\"$(echo "$alpn" | sed 's/,/", "/g')\""
+  fi 
+
+  special=""
+  if [ "$security" = "tls" ] || [ "$security" = "xtls" ]; then
+    [ -z "$sni" ] && read_fake_sni
+    [ -z "$sni" ] && sni="$address"
+  fi
+
+  if [ "$network" = "ws"  ]; then
+    [ -z "$header_host" ] && read_fake_host
+  fi
+
+  if [ -n "$special" ]; then
+      allowInsecure=true
+  else
+    read_allowInsecure
+  fi
+  local template="$TEMPLATES/trojan-$security-$network.conf"
+  echo -e "${ansi_blue}📁 Используем шаблон: $template${ansi_std}"
+  local bak="${CONF}.bak"
+
+  if [ ! -f "$template" ]; then
+    echo -e "${ansi_red}❌ Шаблон не найден: $template${ansi_std}"
+    return 1
+  fi
+
+  # Бэкап
+  if [ -f "$CONF" ] && [ "$cfg_file" = "$CONF" ]; then
+    mv "$CONF" "$bak"
+    echo -e "${ansi_yellow}🔁 Старый конфиг сохранён как $bak${ansi_std}"
+  fi
+  sed \
+    -e "s|__description__|$desc|g" \
+    -e "s|__local_port__|$local_port|g" \
+    -e "s|__password__|$password|g" \
+    -e "s|__host__|$address|g" \
+    -e "s|__port__|$port|g" \
+    -e "s|__serviceName__|$serviceName|g" \
+    -e "s|__network__|$network|g" \
+    -e "s|__security__|$security|g" \
+    -e "s|__sni__|$sni|g" \
+    -e "s|__allowInsecure__|$allowInsecure|g" \
+    -e "s|__path__|$path|g" \
+    -e "s|__header_host__|$header_host|g" \
+    -e "s|__browser_fp__|$browser_fp|g" \
+    -e "s|__pub_key__|$pub_key|g" \
+    -e "s|__short_id__|$short_id|g" \
+    -e "s|__spiderX__|$spiderX|g" \
+    -e "s|__alpn__|$alpn|g" \
+  "$template" > "${cfg_file}"
+  echo -e "${ansi_white}Конфигурационный файл настроен${ansi_std}"
+}
+
 url_config() {
   local link="$1"
   [ -z "$CONF" ] && echo -e "${ansi_red}❌ Не задан путь к конфигу \$CONF${ansi_std}" && return 1
@@ -396,6 +539,7 @@ url_config() {
 	[ -z "$link" ] || [[ "$link" =~ ^[Qq]$ ]]  && return 1
   case "$link" in
     vless://*) parse_vless "$link" "$LOCAL_PORT" "$CONF" ;;
+    trojan://*) parse_trojan "$link" "$LOCAL_PORT" "$CONF" ;;
     ss://*) parse_shadowsocks "$link" "$LOCAL_PORT" "$CONF" ;;
 #    trojan://*) parse_trojan "$link" ;;
     *) echo -e "${ansi_red}Неподдерживаемый протокол${ansi_std}"; return 1 ;;
@@ -488,6 +632,11 @@ test_url(){
         parse_shadowsocks "$link" "$TEST_PORT" "$temp_conf" 
         server_address=$(sed 's|//.*||; s|#.*||; /^$/d' "$temp_conf" | jq -r '.outbounds[0].settings.servers[0].address')
         ;;
+    trojan://*)
+        parse_trojan "$link" "$TEST_PORT" "$temp_conf"
+        server_address=$(sed 's|//.*||; s|#.*||; /^$/d' "$temp_conf" | jq -r '.outbounds[0].settings.servers[0].address')
+        ;;
+    *) echo -e "${ansi_red}Неподдерживаемый протокол${ansi_std}"; return 1 ;;
   esac
   [ ! -f "$temp_conf" ] && echo -e "${ansi_red}❌ Нет сгенерированного конфигурационного файла: ${temp_conf}${ansi_std}" && return 1
   # Заменяем inbounds на HTTP-прокси
@@ -752,12 +901,13 @@ case "$1" in
     check
     ;;	
   info)
+    desc=$(sed 's|//.*||; s|#.*||; /^$/d' "$CONF" | jq -r '.desc // "нет тэга описания"')
     if [ "$INTERACTIVE" -eq 1 ]; then
       echo "Плагин: $PR_NAME Версия: $VERSION"
 		  echo "Тип: $PR_TYPE"
-		  echo "Описание: $DESCRIPTION"
+		  echo "Описание: $desc"
     else
-        echo "{\"name\":\"$PR_NAME\",\"description\":\"$DESCRIPTION\",\"type\":\"$PR_TYPE\",\"method\":\"$METOD\"}"
+        echo "{\"name\":\"$PR_NAME\",\"description\":\"$desc\",\"type\":\"$PR_TYPE\",\"method\":\"$METOD\"}"
     fi
     ;;
   get_param)
