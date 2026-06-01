@@ -46,6 +46,10 @@ find "$DATA_DIR" -type d -print0 | while IFS= read -r -d $'\0' dir; do
     set_perms "$dir" 755
 done
 
+find "$DATA_DIR/opt/apps/kvl/bin/plugins/templates/" -type f -print0 | while IFS= read -r -d $'\0' file; do
+    set_perms "$file" 644
+done
+
 set_perms "$DATA_DIR/opt/apps/kvl/bin/plugins/xray-core.sh" 755
 
 

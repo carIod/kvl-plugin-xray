@@ -1,6 +1,6 @@
 #!/bin/sh
 
-VERSION=1.0.1
+VERSION=1.0.2
 PR_NAME="Xray-core"
 PR_TYPE="Прозрачный прокси"
 #DESCRIPTION="Xray (vless/ss)"
@@ -15,10 +15,11 @@ METOD=tproxy
 TCP_WAY=tproxy
 LOCAL_PORT=1181
 #============================================= тестирование соединения ==================================================================
-PING_COUNT=10
+PING_COUNT=3
 PING_TIMEOUT=1
 TEST_PORT=1888
-URL_TEST="http://cachefly.cachefly.net/10mb.test"
+URL_TEST="http://cachefly.cachefly.net/1mb.test"
+URL_TEST_SIZE=1048576
 #========================================================================================================================================
 
 ansi_red="\033[1;31m";
@@ -605,9 +606,6 @@ replace_inbounds() {
 
 # Если пользователь прервет основной скрипт убить и дочерние если создавались
 cleanup_test() {
-  if [ -n "$PING_PID" ] && kill -0 "$PING_PID" 2>/dev/null; then
-    kill "$PING_PID" 2>/dev/null
-  fi
   if [ -n "$XRAY_PID" ] && kill -0 "$XRAY_PID" 2>/dev/null; then
     kill "$XRAY_PID" 2>/dev/null
   fi  
@@ -618,9 +616,7 @@ test_url(){
   [ -z "$link" ] && read_value "${ansi_green}🔗 Введите ссылку Xray (ss:// или vless://)" link
   [ -z "$link" ] || [[ "$link" =~ ^[Qq]$ ]]  && return 1
   local temp_conf="/tmp/xray-test.json"
-  local temp_pid="/tmp/xray-test.pid"
   local temp_log="/tmp/xray-test.log"
-  local temp_std="/tmp/xray-test.std"
   local server_address
   trap cleanup_test EXIT INT TERM
   case "$link" in
@@ -638,25 +634,26 @@ test_url(){
         ;;
     *) echo -e "${ansi_red}Неподдерживаемый протокол${ansi_std}"; return 1 ;;
   esac
-  [ ! -f "$temp_conf" ] && echo -e "${ansi_red}❌ Нет сгенерированного конфигурационного файла: ${temp_conf}${ansi_std}" && return 1
+  [ ! -f "$temp_conf" ] && { echo -e "${ansi_red}❌ Нет сгенерированного конфигурационного файла: ${temp_conf}${ansi_std}"; return 1; }
+  [ -z "$server_address" ] && { echo -e "${ansi_red}❌ Не удалось получить адрес сервера ${ansi_std}"; return 1; }
   # Заменяем inbounds на HTTP-прокси
   replace_inbounds "$temp_conf" "$temp_log"
   
-  # запускаем пинг на сервер в фоне
-  echo -e "${ansi_blue}Запускаем xray с тестовым конфигом и начинаем тесты в фоне${ansi_std}"
-  echo -e "${ansi_white}Одновременно запускаем пинг сервера — он завершится после окончания тестов${ansi_std}"
-  ping_start_bg "$server_address"
-  : > "$temp_std"
-  
-    # Запуск xray во фоне
-  xray run -c "$temp_conf" >"$temp_log" 2>&1 &
+    # Шаг 1: Измеряем пинг до запуска xray
+  echo -e "${ansi_blue}Шаг 1: Проверка доступности сервера (${server_address})...${ansi_std}"
+  ping -c "$PING_COUNT" -W "$PING_TIMEOUT" "$server_address"
+  echo -e "${ansi_green}✅ Замер задержки окончен.${ansi_std}"  
+
+  # Шаг 2: Запуск xray
+  echo -e "${ansi_blue}Шаг 2: Запускаем $PR_NAME с тестовым конфигом...${ansi_std}"
+  $PROC run -c "$temp_conf" >"$temp_log" 2>&1 &
   XRAY_PID=$!
-  echo "$XRAY_PID" > "$temp_pid"
-    # Ждём запуска процесса (макс 10 секунд)
-    i=0
-    while [ "$i" -lt 10 ]; do
+
+  # Ждём запуска процесса (макс 10 секунд)
+  i=0
+  while [ "$i" -lt 10 ]; do
       if kill -0 "$XRAY_PID" 2>/dev/null; then
-        echo -e "${ansi_green}✅ Xray test instance был запущен (PID: $XRAY_PID)${ansi_std}" >> $temp_std
+        echo -e "${ansi_green}✅ $PR_NAME test instance был запущен (PID: $XRAY_PID)${ansi_std}"
         break
       fi
     sleep 1
@@ -664,8 +661,8 @@ test_url(){
   done
   # Проверка: успел ли стартовать
   if ! kill -0 "$XRAY_PID" 2>/dev/null; then
-    echo -e "${ansi_red}❌ Не удалось запустить Xray test instance${ansi_std}" >> $temp_std
-    [ -f "$temp_log" ] && { echo "--- Содержимое лога ---"; cat "$temp_log"; } >> $temp_std
+    echo -e "${ansi_red}❌ Не удалось запустить $PR_NAME test instance${ansi_std}"
+    [ -f "$temp_log" ] && { echo "--- Содержимое лога ---"; cat "$temp_log"; }
     return 1
   fi
   # проверяем в лог файле что сервер запустился 
@@ -673,11 +670,12 @@ test_url(){
   success=0
   while [ $i -lt 10 ]; do
       sleep 1
-      # Если порт открыт — успех
+      # 1. Если порт открыт — это 100% успех, выходим из цикла
       if netstat -lnpt 2>/dev/null | grep -q ":$TEST_PORT"; then
         success=1
         break
       fi
+      # 2. Если в логе ошибка старта (для sing-box ищем "FATAL" или "failed") — выходим сразу
       if grep -q "Failed to start" "$temp_log"; then
         success=0
         break
@@ -686,53 +684,98 @@ test_url(){
   done
 
   if [ "$success" -eq 0 ]; then
-      echo -e "${ansi_red}❌ Ошибка: не открылся порт проверки: $TEST_PORT${ansi_std}" >> "$temp_std"
-      cat "$temp_log"
+      echo -e "${ansi_red}❌ Ошибка: не удалось дождаться открытия порта проверки: $TEST_PORT${ansi_std}"
+      [ -f "$temp_log" ] && { echo "--- Лог ошибок бинарника ---"; cat "$temp_log"; }
       kill "$XRAY_PID" 2>/dev/null
-      rm -f "$temp_conf" "$temp_log" "$temp_pid"
+      rm -f "$temp_conf" "$temp_log"
       return 1
   fi
 
-  echo -e "${ansi_white}🔍 Проверка IP через прокси на myip.wtf ...${ansi_std}" >> "$temp_std"
+  echo -e "${ansi_white}🔍 Проверка IP через прокси на myip.wtf ...${ansi_std}"
   local output
-  local flag_speed_test=0
-  output=$(curl -s --max-time 10 -x http://127.0.0.1:$TEST_PORT https://myip.wtf/json)
+
+  output=$(curl -s --max-time 10 -x http://127.0.0.1:$TEST_PORT https://ipv4.myip.wtf/json)
   # проверяем что ответ получен
   if echo "$output" | grep -q '"YourFuckingIPAddress"'; then
-    echo -e "${ansi_green}✅ Успешно получены данные с сайта myip.wtf:${ansi_std}" >> "$temp_std"
-    echo -e "${ansi_white}   🔍 Запускаем проверку скорости ...${ansi_std}" >> "$temp_std"
+
+    echo "$output" | awk '
+        /"YourFuckingIPAddress"/   { sub(/^.*: /, ""); gsub(/[",]/,""); print "   🌐 IP         : " $0 }
+        /"YourFuckingLocation"/    { sub(/^.*: /, ""); gsub(/[",]/,""); print "   📍 Location   : " $0 }
+        /"YourFuckingHostname"/    { sub(/^.*: /, ""); gsub(/[",]/,""); print "   🖥 Hostname    : " $0 }
+        /"YourFuckingISP"/         { sub(/^.*: /, ""); gsub(/[",]/,""); print "   🏢 ISP        : " $0 }
+        /"YourFuckingCity"/        { sub(/^.*: /, ""); gsub(/[",]/,""); print "   🏙 City        : " $0 }
+        /"YourFuckingCountry"/     { sub(/^.*: /, ""); gsub(/[",]/,""); print "   🌎 Country    : " $0 }
+    '
+    echo -e ""
+    echo -e "${ansi_white}   🔍 Запускаем проверку скорости ...${ansi_std}"
+
+    # --- ОКОНЧАТЕЛЬНЫЙ БЛОК ТЕСТА СКОРОСТИ (ЛИНЕЙНЫЙ) ---
+    local attempt=1
+    local max_attempts=3
+    local success_download=0
     
-    if start_speed_test "$temp_std"; then
-      # Вычисления с помощью awk
-      echo -e "${ansi_green}    ✅ Успешно выполнен тест скорости${ansi_std}" >> "$temp_std"
-      flag_speed_test=1
+    while [ $attempt -le $max_attempts ]; do
+      echo -e "${ansi_white}      Попытка $attempt из $max_attempts...${ansi_std}"
+      
+      # Очищаем старый временный лог перед каждым замером
+      : > /tmp/curl_time.txt
+      
+      # curl показывает живой прогресс-бар на экране, а тайминги пишет в файл
+      curl --progress-bar --max-time 60 \
+          -w "%{http_code}|%{size_download}|%{time_namelookup}|%{time_connect}|%{time_starttransfer}|%{time_total}|%{speed_download}\n" \
+          -x http://127.0.0.1:$TEST_PORT \
+          -o /dev/null "$URL_TEST" > /tmp/curl_time.txt
+
+      # Считываем полученные тайминги в переменные текущей сессии
+      IFS='|' read -r http_code size_file t_namelookup t_connect t_starttransfer t_total speed_bytes <<EOF
+$(cat /tmp/curl_time.txt)
+EOF
+      rm -f /tmp/curl_time.txt
+      
+      # Проверка: код 200 и размер соответствует переменной URL_TEST_SIZE
+      if [ "$http_code" = "200" ] && [ "$size_file" -ge "$URL_TEST_SIZE" ]; then
+        success_download=1
+        break
+      fi
+      
+      echo -e "${ansi_yellow}      ⚠️ Попытка не удалась (код: $http_code, получено: $size_file байт), повтор...${ansi_std}"
+      attempt=$((attempt + 1))
+      sleep 2
+    done
+    # --- КОНЕЦ БЛОКА ТЕСТА СКОРОСТИ ---
+    
+    # Обработка результатов, если скачивание завершилось успехом
+    if [ "$success_download" -eq 1 ]; then
+      echo -e "${ansi_green}    ✅ Успешно выполнен тест скорости${ansi_std}"
+      
+      # Вычисления через awk (работают идеально, так как переменные не потерялись)
       latency_ms=$(awk "BEGIN { printf \"%.2f\", ($t_connect - $t_namelookup) * 1000 }")
       wait_ms=$(awk "BEGIN { printf \"%.2f\", ($t_starttransfer - $t_connect) * 1000 }")
       download_time_s=$(awk "BEGIN { printf \"%.2f\", $t_total - $t_starttransfer }")
       speed_mbps=$(awk "BEGIN { printf \"%.2f\", ($speed_bytes * 8) / 1000000 }")
       dns_ms=$(awk "BEGIN { printf \"%.2f\", $t_namelookup * 1000 }")   
+      
+      print_line
+      echo " ⏱️  DNS Lookup:        $dns_ms мс"
+      echo " ⏱️  Латентность TCP:   $latency_ms мс"
+      echo " ⏱️  Ожидание ответа:   $wait_ms мс"
+      echo " ⏱️  Скачивание файла:  $download_time_s сек"
+      echo "     Скорость:          $speed_mbps Мбит/с"
+      # echo " ⏱️  Время до установления TCP+TLS соединения:  ${connect_time}s"
+      # echo " ⏱️  Время до ответа сервера                 :  ${starttransfer_time}s"
+      # echo "            Если это время большое — значит сервер тормозит, загружен или далеко."
+      # echo " ⏱️  Полное время загрузки (Total)           :  ${total_time}s"      
+    else
+      echo -e "${ansi_red}    ❌ Не удалось измерить скорость после $max_attempts попыток${ansi_std}"
     fi  
+  else
+    echo -e "${ansi_red}❌ Прокси не работает или сайт myip.wtf не отвечает${ansi_std}"
+    print_line
+    [ -f "$temp_log" ] && { echo "--- Содержимое лога ---"; cat "$temp_log"; }
   fi
-  
-  if kill "$PING_PID" 2>/dev/null; then
-    i=0
-    while [ "$i" -lt 5 ]; do
-        if ! kill -0 "$PING_PID" 2>/dev/null; then
-            break
-        fi
-        sleep 1
-        i=$((i + 1))
-    done
-    if kill -0 "$PING_PID" 2>/dev/null; then
-        echo -e "${ansi_yellow}⚠️ PING не завершился, принудительное убийство${ansi_std}" >> $temp_std
-        kill -9 "$PING_PID" 2>/dev/null
-    fi
-  fi
-  # Выводим на экран то что выполнялось паралельно
-  cat $temp_std
 
-  # Убить xray
-  echo -e "${ansi_white}Проверка завершилась, производим остановку xray${ansi_std}" 
+  # Убить sing-box
+  echo -e "${ansi_white}Проверка завершилась, производим остановку $PR_NAME${ansi_std}" 
   if kill "$XRAY_PID" 2>/dev/null; then
     i=0
     while [ "$i" -lt 5 ]; do
@@ -743,44 +786,12 @@ test_url(){
         i=$((i + 1))
     done
     if kill -0 "$XRAY_PID" 2>/dev/null; then
-        echo -e "${ansi_yellow}⚠️ Xray не завершился, принудительное убийство${ansi_std}"
+        echo -e "${ansi_yellow}⚠️ $PR_NAME не завершился, принудительное убийство${ansi_std}"
         kill -9 "$XRAY_PID" 2>/dev/null
     fi
   fi
-   
-
-    # Парсим JSON-ответ
-    if echo "$output" | grep -q '"YourFuckingIPAddress"'; then
-        echo -e "${ansi_green}✅ Результаты проверок:${ansi_std}"
-        echo "$output" | awk '
-            /"YourFuckingIPAddress"/   { sub(/^.*: /, ""); gsub(/[",]/,""); print "   🌐 IP         : " $0 }
-            /"YourFuckingLocation"/    { sub(/^.*: /, ""); gsub(/[",]/,""); print "   📍 Location   : " $0 }
-            /"YourFuckingHostname"/    { sub(/^.*: /, ""); gsub(/[",]/,""); print "   🖥 Hostname    : " $0 }
-            /"YourFuckingISP"/         { sub(/^.*: /, ""); gsub(/[",]/,""); print "   🏢 ISP        : " $0 }
-            /"YourFuckingCity"/        { sub(/^.*: /, ""); gsub(/[",]/,""); print "   🏙 City        : " $0 }
-            /"YourFuckingCountry"/     { sub(/^.*: /, ""); gsub(/[",]/,""); print "   🌎 Country    : " $0 }
-        '
-        if [ "$flag_speed_test" = "1" ]; then
-          print_line
-          echo " ⏱️  DNS Lookup:        $dns_ms мс"
-          echo " ⏱️  Латентность TCP:   $latency_ms мс"
-          echo " ⏱️  Ожидание ответа:   $wait_ms мс"
-          echo " ⏱️  Скачивание файла:  $download_time_s сек"
-          echo "     Скорость:          $speed_mbps Мбит/с"
-          # echo " ⏱️  Время до установления TCP+TLS соединения:  ${connect_time}s"
-          # echo " ⏱️  Время до ответа сервера                 :  ${starttransfer_time}s"
-          # echo "            Если это время большое — значит сервер тормозит, загружен или далеко."
-          # echo " ⏱️  Полное время загрузки (Total)           :  ${total_time}s"
-        fi
-
-    else
-        echo -e "${ansi_red}❌ Прокси не работает или сайт не отвечает${ansi_std}"
-        echo -e "${ansi_white}🔍 Содержимое /tmp/log/xray_test.log:${ansi_std}"
-        print_line
-        cat "$temp_log"
-    fi
-    # Очистка
-    rm -f "$temp_conf" "$temp_pid" "$temp_log" "$temp_std"
+  # Очистка
+  rm -f "$temp_conf" "$temp_log" 
 }
 
 start(){
